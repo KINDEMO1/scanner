@@ -190,50 +190,86 @@ def check_fingerprint(cname_target: str, response_body: str) -> tuple[bool, str]
                 return True, f"{sig} (matched {provider})"
     return False, "No known signature"
 
-
+#changes
 def classify_risk(
     dns_status: str,
     http_status: int,
     fingerprint: str,
     http_error: str,
+    provider: str,
+    cname_target: str,  
 ) -> tuple[str, str]:
     """
-    Classify risk using the same logic as classify-subdomain.tsx.
-    Returns (severity, label).
+    Classify risk based strictly on the 'Rule of Three'.
     """
-    is_vulnerable_fp = fingerprint not in (
+
+    clean_cname = cname_target.lower().rstrip('.')
+
+    if clean_cname in ["google.com", "www.google.com", "maps.google.com"]:
+        return "LOW", "Pointed to Google Main (Safe/Not Exploitable)"
+    
+    if provider == "Unknown Provider" and "google.com" in clean_cname:
+        return "LOW", "Pointed to Generic Google (Safe)"
+    
+    # CONDITION 1: DNS Record (Nakaturo sa 3rd party service)
+  
+    is_third_party = provider != "Unknown Provider"
+
+    # CONDITION 2: HTTP Status (Error code or Connection Failed)
+   
+    is_broken = http_status == 0 or http_status >= 400
+
+    # CONDITION 3: Fingerprint (Specific error message)
+    
+    has_fingerprint = fingerprint not in (
         "",
         "No known signature",
         "Service protected or active",
     )
+
     has_pointer = dns_status in ("CNAME", "A")
-    is_broken = http_status == 0 or http_status >= 400
 
-    # CRITICAL: CNAME/A exists + known takeover fingerprint + broken HTTP
-    if has_pointer and is_vulnerable_fp and is_broken:
-        return "CRITICAL", "Confirmed Subdomain Takeover"
+    # ──────────────────────────────────────────────────────────
+    # STRICT CRITICAL CHECK (Must satisfy ALL 3 conditions)
+    # ──────────────────────────────────────────────────────────
+    if is_third_party and is_broken and has_fingerprint:
+        return "CRITICAL", "Confirmed Subdomain Takeover (All 3 Conditions Met)"
 
-    # CRITICAL: CNAME/A exists + known takeover fingerprint + HTTP 200
-    # (service is serving default unclaimed page)
-    if has_pointer and is_vulnerable_fp and http_status == 200:
-        return "CRITICAL", "Subdomain Takeover (Unclaimed Service Responding 200)"
+    # EDGE CASE: 200 OK but unclaimed (e.g., Unbounce/Wordpress)
+ 
+    if is_third_party and http_status == 200 and has_fingerprint:
+         return "CRITICAL", "Subdomain Takeover (Service Responding 200 with Fingerprint)"
 
-    # HIGH: CNAME/A exists + broken HTTP but no known fingerprint
-    if has_pointer and is_broken:
-        # Distinguish between truly orphaned (no server at all) and just 404
-        if http_status == 0 and http_error in ("Connection Failed", "Timeout"):
-            return "HIGH", "Orphaned DNS Record (No Server Responding)"
-        return "HIGH", "Dangling Subdomain - Manual Validation Required"
+    # ──────────────────────────────────────────────────────────
+    # LOWER RISK LEVELS (Kung kulang ng isang condition)
+    # ──────────────────────────────────────────────────────────
 
-    # LOW: No DNS record at all
+    # HIGH: 3rd Party + Broken, but NO Fingerprint.
+
+    if is_third_party and is_broken:
+        return "HIGH", "Dangling Pointer to 3rd Party (No Fingerprint)"
+
+    # HIGH: May fingerprint but Unknown Provider.
+  
+    if not is_third_party and has_fingerprint and is_broken:
+        return "HIGH", "Suspicious Content (Fingerprint found but Provider Unknown)"
+
+    # MEDIUM: Dangling CNAME to unknown destination
+    if dns_status == "A" and is_broken:
+            return "LOW", "Dead A Record (Not Takeover)"
+    
+    if dns_status == "CNAME" and is_broken:
+         return "INFO", "Dangling CNAME (Unknown Destination)"
+
+    # LOW: No DNS
     if dns_status == "NXDOMAIN":
         return "LOW", "No DNS Record - Not Exploitable"
 
-    # MEDIUM: Everything else (CNAME/A exists, HTTP works, no fingerprint)
+    # MEDIUM: Active site
     if has_pointer and http_status == 200:
-        return "MEDIUM", "Active Subdomain - Verify Ownership"
+        return "INFO", "Active Subdomain - Verify Ownership"
 
-    return "MEDIUM", "Orphaned or Misconfigured Subdomain"
+    return "INFO", "Orphaned or Misconfigured Subdomain"
 
 
 def determine_security_issue(
@@ -412,7 +448,7 @@ def scan_subdomain(subdomain: str) -> dict:
     is_vuln, fingerprint = check_fingerprint(cname_target, body)
 
     # 5 -- Risk classification
-    risk_level, risk_label = classify_risk(dns_status, http_status, fingerprint, http_error)
+    risk_level, risk_label = classify_risk(dns_status, http_status, fingerprint, http_error, provider, cname_target)
 
     # 6 -- Security issue label
     security_issue = determine_security_issue(dns_status, http_status, fingerprint, risk_level)
@@ -526,7 +562,7 @@ def main():
     total = len(results)
     critical = sum(1 for r in results if r["Risk Level"] == "CRITICAL")
     high = sum(1 for r in results if r["Risk Level"] == "HIGH")
-    medium = sum(1 for r in results if r["Risk Level"] == "MEDIUM")
+    info = sum(1 for r in results if r["Risk Level"] == "INFO")
     low = sum(1 for r in results if r["Risk Level"] == "LOW")
 
     print(f"\n{'=' * 60}")
@@ -534,7 +570,7 @@ def main():
     print(f"{'=' * 60}")
     print(f"  CRITICAL : {critical}  (Confirmed Takeover)")
     print(f"  HIGH     : {high}  (Dangling / Orphaned)")
-    print(f"  MEDIUM   : {medium}  (Misconfigured / Review)")
+    print(f"  INFO   : {info}  (Misconfigured / Review)")
     print(f"  LOW      : {low}  (NXDOMAIN / Safe)")
     print(f"{'=' * 60}")
     print(f"\n[+] Results saved to {output_file}")
