@@ -162,6 +162,32 @@ USER_AGENT = (
 )
 
 
+def extract_base_domain(domain: str) -> str:
+    """
+    Extract the base domain from a FQDN.
+    Examples:
+    - "sample.com" -> "sample"
+    - "api.sample.com" -> "sample"
+    - "api.sample.co.uk" -> might return "sample" (simple 2-3 level split)
+    """
+    # Simple heuristic: split by dots and get second-to-last part
+    parts = domain.lower().rstrip(".").split(".")
+    if len(parts) >= 2:
+        return parts[-2]  # Return "sample" from "sample.com" or "api.sample.com"
+    return parts[0] if parts else ""
+
+
+def is_sister_domain(source_domain: str, target_domain: str) -> bool:
+    """
+    Check if source and target share the same base domain.
+    E.g., sample.com and sample.io = sister domains (both "sample")
+    Returns True if they're internal/owned by same entity.
+    """
+    source_base = extract_base_domain(source_domain)
+    target_base = extract_base_domain(target_domain)
+    return source_base and target_base and source_base == target_base
+
+
 def identify_provider(cname_target: str) -> str:
     """Return the friendly provider name if the CNAME contains a known domain."""
     for domain, provider in PROVIDER_MAP.items():
@@ -170,10 +196,13 @@ def identify_provider(cname_target: str) -> str:
     return "Unknown Provider"
 
 
-def check_fingerprint(cname_target: str, response_body: str) -> tuple[bool, str]:
+def check_fingerprint(cname_target: str, response_body: str, dns_status: str = "") -> tuple[bool, str]:
     """
     Scan response body for known takeover signatures.
     Returns (is_vulnerable, matched_signature).
+
+    NOTE: To avoid false positives on plain A records, we only run the
+    fallback "scan all signatures" when the record is not an A record.
     """
     lower_cname = cname_target.lower()
     for provider_domain, signatures in FINGERPRINTS.items():
@@ -182,7 +211,9 @@ def check_fingerprint(cname_target: str, response_body: str) -> tuple[bool, str]
                 if sig in response_body:
                     return True, sig
             return False, "Service protected or active"
-    # Fallback: scan ALL signatures regardless of CNAME (catches edge cases)
+    # Fallback: scan ALL signatures regardless of CNAME, but avoid for A records
+    if dns_status == "A":
+        return False, "No known signature"
     for provider_domain, signatures in FINGERPRINTS.items():
         for sig in signatures:
             if sig in response_body:
@@ -196,9 +227,16 @@ def classify_risk(
     http_status: int,
     fingerprint: str,
     http_error: str,
+    subdomain: str = "",
+    cname_target: str = "",
+    dns_lookup_text: str = "",
 ) -> tuple[str, str]:
     """
     Classify risk using the same logic as classify-subdomain.tsx.
+    Implements three safety overrides:
+    1. Timeout Override: Timeouts never trigger HIGH alerts
+    2. Sister Domain Check: Same base domain = INTERNAL/SAFE
+    3. Require Proof for HIGH: Need known signature OR NXDOMAIN on third-party
     Returns (severity, label).
     """
     is_vulnerable_fp = fingerprint not in (
@@ -207,23 +245,49 @@ def classify_risk(
         "Service protected or active",
     )
     has_pointer = dns_status in ("CNAME", "A")
+    has_cname = dns_status == "CNAME"
     is_broken = http_status == 0 or http_status >= 400
 
-    # CRITICAL: CNAME/A exists + known takeover fingerprint + broken HTTP
-    if has_pointer and is_vulnerable_fp and is_broken:
+    # ─── SAFETY CHECK #1: Sister Domain Check ───
+    # If source and target are sister domains (same base), mark as internal/safe
+    if subdomain and cname_target and is_sister_domain(subdomain, cname_target):
+        if http_status == 200:
+            return "LOW", "Internal Sister Domain - Active"
+        elif http_status == 0 and http_error == "Timeout":
+            return "INFO", "Internal Sister Domain - Timeout (Safe)"
+        elif http_status >= 400 or http_status == 0:
+            return "LOW", "Internal Sister Domain - Misconfigured"
+
+    # ─── SAFETY CHECK #2: Timeout Override ───
+    # Timeouts should NEVER trigger HIGH or CRITICAL alerts
+    if http_status == 0 and http_error == "Timeout":
+        if has_pointer:
+            return "INFO", "Timeout - Network Issue (Not Exploitable)"
+        else:
+            return "INFO", "Timeout - Network Issue"
+
+    # CRITICAL: Only escalate to CRITICAL when there's a CNAME pointing to
+    # a known provider signature (or fallback proof) — A records alone do not
+    # indicate a takeover target.
+    if has_cname and is_vulnerable_fp and is_broken:
         return "CRITICAL", "Confirmed Subdomain Takeover"
 
-    # CRITICAL: CNAME/A exists + known takeover fingerprint + HTTP 200
-    # (service is serving default unclaimed page)
-    if has_pointer and is_vulnerable_fp and http_status == 200:
+    # CRITICAL: CNAME exists + known takeover fingerprint + HTTP 200
+    if has_cname and is_vulnerable_fp and http_status == 200:
         return "CRITICAL", "Subdomain Takeover (Unclaimed Service Responding 200)"
 
-    # HIGH: CNAME/A exists + broken HTTP but no known fingerprint
-    if has_pointer and is_broken:
-        # Distinguish between truly orphaned (no server at all) and just 404
-        if http_status == 0 and http_error in ("Connection Failed", "Timeout"):
+    # ─── SAFETY CHECK #3: Require Proof for HIGH Risk ───
+    # HIGH risk only if:
+    # - Truly orphaned (no server at all, connection failed)
+    # - AND server doesn't belong to us (not sister domain)
+    # - AND we have proof (NXDOMAIN on target root or missing entirely)
+    if has_cname and http_status == 0 and http_error in ("Connection Failed",):
+        # Orphaned: no server responding at all. Require proof before escalating
+        # to HIGH: either a known provider fingerprint or the CNAME target NXDOMAIN.
+        if is_vulnerable_fp or (dns_lookup_text and "[CNAME target NXDOMAIN]" in dns_lookup_text):
             return "HIGH", "Orphaned DNS Record (No Server Responding)"
-        return "HIGH", "Dangling Subdomain - Manual Validation Required"
+        # Downgrade unproven connection failures to LOW (likely network/internal)
+        return "LOW", "No proof of dangling DNS; network/internal (Low)"
 
     # LOW: No DNS record at all
     if dns_status == "NXDOMAIN":
@@ -232,6 +296,11 @@ def classify_risk(
     # MEDIUM: Everything else (CNAME/A exists, HTTP works, no fingerprint)
     if has_pointer and http_status == 200:
         return "MEDIUM", "Active Subdomain - Verify Ownership"
+
+    # MEDIUM: DNS record exists but HTTP has errors (4xx/5xx, SSL errors, etc)
+    # This is NOT dangling DNS - the server responds or has valid DNS
+    if has_pointer and is_broken:
+        return "MEDIUM", "Misconfigured or Broken Service"
 
     return "MEDIUM", "Orphaned or Misconfigured Subdomain"
 
@@ -252,10 +321,17 @@ def determine_security_issue(
 
     if risk_level == "CRITICAL":
         return "Subdomain Takeover"
+    if risk_level == "INFO":
+        return "None - Network Issue or Internal"
     if has_pointer and http_status == 200 and not is_vulnerable_fp:
         return "None - Active Service"
-    if has_pointer and (http_status >= 400 or http_status == 0):
+    # Only report Dangling if it's truly orphaned (no server responding)
+    if risk_level == "HIGH" and http_status == 0:
         return "Dangling DNS Record"
+    if risk_level == "LOW":
+        return "None - Low Risk"
+    if has_pointer and (http_status >= 400 or http_status == 0):
+        return "Misconfigured or Broken Service"
     if dns_status == "NXDOMAIN":
         return "None - NXDOMAIN"
     return "Potential Misconfiguration"
@@ -408,11 +484,13 @@ def scan_subdomain(subdomain: str) -> dict:
     # 3 -- Provider identification
     provider = identify_provider(cname_target)
 
-    # 4 -- Fingerprint scan
-    is_vuln, fingerprint = check_fingerprint(cname_target, body)
+    # 4 -- Fingerprint scan (pass dns_status to avoid A-record fallbacks)
+    is_vuln, fingerprint = check_fingerprint(cname_target, body, dns_status)
 
     # 5 -- Risk classification
-    risk_level, risk_label = classify_risk(dns_status, http_status, fingerprint, http_error)
+    risk_level, risk_label = classify_risk(
+        dns_status, http_status, fingerprint, http_error, subdomain, cname_target, dns_lookup_text
+    )
 
     # 6 -- Security issue label
     security_issue = determine_security_issue(dns_status, http_status, fingerprint, risk_level)
@@ -528,6 +606,7 @@ def main():
     high = sum(1 for r in results if r["Risk Level"] == "HIGH")
     medium = sum(1 for r in results if r["Risk Level"] == "MEDIUM")
     low = sum(1 for r in results if r["Risk Level"] == "LOW")
+    INFO = sum(1 for r in results if r["Risk Level"] == "INFO")
 
     print(f"\n{'=' * 60}")
     print(f"  SCAN COMPLETE -- {total} subdomain(s)")
@@ -536,6 +615,7 @@ def main():
     print(f"  HIGH     : {high}  (Dangling / Orphaned)")
     print(f"  MEDIUM   : {medium}  (Misconfigured / Review)")
     print(f"  LOW      : {low}  (NXDOMAIN / Safe)")
+    print(f"  INFO     : {INFO}  (Network Issue / Internal)")
     print(f"{'=' * 60}")
     print(f"\n[+] Results saved to {output_file}")
 
